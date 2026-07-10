@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smooth 3D Horizon Racer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body, html { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: sans-serif; }
+        #gameCanvas { display: block; width: 100vw; height: 100vh; background: #74ccf4; }
+        #ui {
+            position: absolute; top: 20px; left: 20px; color: white;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.8); font-size: 24px; pointer-events: none;
+        }
+        #controls-hint {
+            position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+            color: rgba(255,255,255,0.8); text-shadow: 1px 1px 2px #000; font-size: 16px; text-align: center;
+        }
+        #audio-notice {
+            position: absolute; top: 20px; right: 20px; background: rgba(0,0,0,0.5);
+            color: white; padding: 8px 12px; border-radius: 5px; font-size: 12px; cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="gameCanvas"></canvas>
+    
+    <div id="ui">
+        <div>Speed: <span id="speedo">0</span> km/h</div>
+        <div style="font-size: 16px; margin-top: 5px;">Score: <span id="score">0</span></div>
+    </div>
+
+    <div id="controls-hint">
+        <strong>WASD / Arrow Keys</strong>: Accelerate, Brake, Steer | <strong>C</strong>: Change Camera Angle
+    </div>
+
+    <div id="audio-notice" onclick="toggleAudio()">🎵 Synthesize Engine/Music</div>
+
+    <script>
+        const canvas = document.getElementById("gameCanvas");
+        const ctx = canvas.getContext("2d");
+
+        // Resize Canvas
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // Game State Variables
+        let speed = 0;
+        const maxSpeed = 120;
+        const accel = 0.5;
+        const breaking = 0.8;
+        const decel = 0.15;
+        let carX = 0; // -1 to 1 (left to right of road)
+        let playerZ = 0;
+        let score = 0;
+        let cameraView = "close"; // close, far, hood
+
+        // Controls State
+        const keys = { ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false, w: false, a: false, s: false, d: false };
+        
+        window.addEventListener('keydown', e => { 
+            if(e.key in keys) keys[e.key] = true;
+            if(e.key.toLowerCase() === 'c') {
+                cameraView = cameraView === "close" ? "far" : cameraView === "far" ? "hood" : "close";
+            }
+        });
+        window.addEventListener('keyup', e => { if(e.key in keys) keys[e.key] = false; });
+
+        // Road Geometry Generation
+        const segments = [];
+        const segmentLength = 200;
+        const roadWidth = 2000;
+        
+        // Generate a long continuous procedural track
+        for(let i = 0; i < 500; i++) {
+            segments.push({
+                index: i,
+                p1: { world: { x: 0, y: 0, z: i * segmentLength }, screen: { x: 0, y: 0, w: 0 } },
+                p2: { world: { x: 0, y: 0, z: (i + 1) * segmentLength }, screen: { x: 0, y: 0, w: 0 } },
+                curve: Math.sin(i / 10) * 2, // smooth curving road
+                // Scenery items (Trees & Mountains coordinates)
+                scenery: [
+                    { x: -1.5 - Math.random()*2, type: 'tree' },
+                    { x: 1.5 + Math.random()*2, type: 'tree' },
+                    { x: -5 - Math.random()*5, type: 'mountain' },
+                    { x: 5 + Math.random()*5, type: 'mountain' }
+                ]
+            });
+        }
+        const trackLength = segments.length * segmentLength;
+
+        // Oncoming Traffic / Other cars
+        const cars = [
+            { z: 2000, x: -0.5, speed: 30, color: '#3498db', exploded: false, explosionTimer: 0 },
+            { z: 5000, x: 0.5, speed: 20, color: '#f1c40f', exploded: false, explosionTimer: 0 },
+            { z: 8000, x: 0, speed: 40, color: '#9b59b6', exploded: false, explosionTimer: 0 },
+            { z: 12000, x: -0.3, speed: 25, color: '#e67e22', exploded: false, explosionTimer: 0 }
+        ];
+
+        // Pseudo-3D Projection Logic
+        function project(p, cameraX, cameraY, cameraZ, cameraDepth) {
+            const worldX = p.world.x - cameraX;
+            const worldY = p.world.y - cameraY;
+            const worldZ = p.world.z - cameraZ;
+            
+            if (worldZ <= 0) return; 
+
+            const scale = cameraDepth / worldZ;
+            p.screen.x = Math.round((canvas.width / 2) + (scale * worldX * canvas.width / 2));
+            p.screen.y = Math.round((canvas.height / 2) - (scale * worldY * canvas.height / 2));
+            p.screen.w = Math.round(scale * roadWidth * canvas.width / 2);
+        }
+
+        // Web Audio API for Engine Sound Effects & Music loop
+        let audioCtx = null;
+        let oscillator = null;
+        function toggleAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                oscillator = audioCtx.createOscillator();
+                let gainNode = audioCtx.createGain();
+                oscillator.type = 'sawtooth';
+                oscillator.frequency.setValueAtTime(60, audioCtx.currentTime); 
+                gainNode.gain.setValueAtTime(0.05, audioCtx.currentTime);
+                oscillator.connect(gainNode);
+                gainNode.connect(audioCtx.destination);
+                oscillator.start();
+                document.getElementById("audio-notice").innerText = "🔊 Audio Active";
+            }
+        }
+
+        function updateAudio() {
+            if (oscillator && audioCtx) {
+                // Modulate engine pitch based on player speed
+                oscillator.frequency.setValueAtTime(40 + (speed * 1.5), audioCtx.currentTime);
+            }
+        }
+
+        // Game Loop
+        function update(dt) {
+            const isAccelerating = keys.ArrowUp || keys.w;
+            const isBraking = keys.ArrowDown || keys.s;
+
+            // Handle Acceleration & Braking
+            if (isAccelerating) speed += accel;
+            else if (isBraking) speed -= breaking;
+            else speed -= decel;
+
+            // Cap Speed
+            if (speed > maxSpeed) speed = maxSpeed;
+            if (speed < 0) speed = 0;
+
+            // Steering Mechanics
+            if (speed > 0) {
+                const steerSpeed = 0.002 * (speed / maxSpeed + 0.5);
+                if (keys.ArrowLeft || keys.a) carX -= steerSpeed * 12;
+                if (keys.ArrowRight || keys.d) carX += steerSpeed * 12;
+            }
+
+            // Move Player along the track z-axis
+            playerZ += speed * 3;
+            if (playerZ >= trackLength) playerZ -= trackLength; // Loop road
+
+            // Keep player inside or slightly off-road bounds smoothly
+            carX = Math.max(-2, Math.min(2, carX));
+
+            // UI Update
+            document.getElementById("speedo").innerText = Math.round(speed);
+            document.getElementById("score").innerText = Math.round(score);
+            if (speed > 1) score += 1;
+
+            updateAudio();
+
+            // Handle Traffic Cars & Collisions
+            cars.forEach(c => {
+                if(!c.exploded) {
+                    c.z -= c.speed; // Opposing traffic moving towards player
+                    if (c.z < playerZ - 2000) { // Respawn far ahead if passed
+                        c.z = playerZ + 15000 + Math.random() * 5000;
+                        c.x = (Math.random() * 1.6) - 0.8;
+                    }
+
+                    // Collision Detection (Check Z boundary and X alignment closeness)
+                    if (Math.abs(c.z - playerZ) < 250 && Math.abs(c.x - carX) < 0.45) {
+                        c.exploded = true;
+                        c.explosionTimer = 30; // 30 frames of explosion
+                        speed = 10; // Major crash slows you down drastically
+                    }
+                } else {
+                    c.explosionTimer--;
+                    if(c.explosionTimer <= 0) {
+                        c.exploded = false;
+                        c.z = playerZ + 15000 + Math.random() * 5000; // Reset car
+                    }
+                }
+            });
+        }
+
+        function draw() {
+            // Clear & Draw Daylight Sky
+            ctx.fillStyle = "#74ccf4";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Sun
+            ctx.fillStyle = "#f1c40f";
+            ctx.beginPath(); ctx.arc(canvas.width * 0.7, canvas.height * 0.25, 40, 0, Math.PI*2); ctx.fill();
+
+            // Set Camera Height Profile configurations based on view state
+            let camHeight = 1000;
+            let camDepth = 0.8;
+            if (cameraView === "far") { camHeight = 1400; camDepth = 0.6; }
+            if (cameraView === "hood") { camHeight = 550; camDepth = 1.0; }
+
+            const startSegment = Math.floor(playerZ / segmentLength);
+            let cameraX = carX * roadWidth;
+            
+            // Dynamic Horizon / Road curve accumulation
+            let dx = 0;
+            let maxPercent = 0;
+
+            // Render Pseudo 3D Scenery from Back to Front (Painter's Algorithm)
+            const renderStack = [];
+
+            for (let n = 0; n < 80; n++) {
+                const segment = segments[(startSegment + n) % segments.length];
+                // Handle looping physics warp adjustment
+                const loopMod = (startSegment + n >= segments.length) ? trackLength : 0;
+
+                project(segment.p1, cameraX - dx, camHeight, playerZ - loopMod, camDepth);
+                project(segment.p2, cameraX - dx - segment.curve, camHeight, playerZ - loopMod, camDepth);
+                
+                dx += segment.curve;
+
+                if (segment.p1.screen.y <= 0 || segment.p1.screen.y >= canvas.height) continue;
+
+                // Draw Environment Background Ground / Grass Plain
+                ctx.fillStyle = (Math.floor((startSegment + n)/3) % 2 === 0) ? "#1e824c" : "#26a65b";
+                ctx.fillRect(0, segment.p2.screen.y, canvas.width, segment.p1.screen.y - segment.p2.screen.y);
+
+                // Draw Road Strip
+                const p1 = segment.p1.screen;
+                const p2 = segment.p2.screen;
+
+                ctx.fillStyle = (Math.floor((startSegment + n)/3) % 2 === 0) ? "#333" : "#3c3c3c";
+                ctx.beginPath();
+                ctx.moveTo(p1.x - p1.w, p1.y); ctx.lineTo(p1.x + p1.w, p1.y);
+                ctx.lineTo(p2.x + p2.w, p2.y); ctx.lineTo(p2.x - p2.w, p2.y);
+                ctx.fill();
+
+                // Center White Line Dividers
+                if ((Math.floor((startSegment + n)/2) % 2 === 0)) {
+                    ctx.fillStyle = "#fff";
+                    ctx.beginPath();
+                    ctx.moveTo(p1.x - p1.w*0.02, p1.y); ctx.lineTo(p1.x + p1.w*0.02, p1.y);
+                    ctx.lineTo(p2.x + p2.w*0.02, p2.y); ctx.lineTo(p2.x - p2.w*0.02, p2.y);
+                    ctx.fill();
+                }
+
+                // Collect Mountain and Tree Scenery elements to safely overlay later
+                segment.scenery.forEach(item => {
+                    renderStack.push({
+                        p: p1,
+                        scale: p1.w / roadWidth,
+                        itemX: p1.x + (item.x * p1.w),
+                        type: item.type
+                    });
+                });
+            }
+
+            // Draw Mountain/Tree Objects
+            renderStack.reverse().forEach(obj => {
+                if(obj.type === 'tree') {
+                    // Draw Trunk
+                    ctx.fillStyle = '#795548';
+                    ctx.fillRect(obj.itemX - 5*obj.scale*10, obj.p.y - 40*obj.scale*10, 10*obj.scale*10, 40*obj.scale*10);
+                    // Draw Foliage Leaves
+                    ctx.fillStyle = '#2e7d32';
+                    ctx.beginPath(); ctx.arc(obj.itemX - 0, obj.p.y - 40*obj.scale*10, 25*obj.scale*10, 0, Math.PI*2); ctx.fill();
+                } else if (obj.type === 'mountain') {
+                    ctx.fillStyle = '#90a4ae';
+                    ctx.beginPath();
+                    ctx.moveTo(obj.itemX - 300*obj.scale, obj.p.y);
+                    ctx.lineTo(obj.itemX, obj.p.y - 180*obj.scale);
+                    ctx.lineTo(obj.itemX + 300*obj.scale, obj.p.y);
+                    ctx.closePath(); ctx.fill();
+                }
+            });
+
+            // Draw Oncoming Traffic Cars
+            cars.forEach(c => {
+                if (c.z > playerZ && c.z < playerZ + 10000) {
+                    const camDepthVal = camDepth;
+                    const scale = camDepthVal / (c.z - playerZ);
+                    const screenX = Math.round((canvas.width / 2) + (scale * (c.x * roadWidth - cameraX) * canvas.width / 2));
+                    const screenY = Math.round((canvas.height / 2) - (scale * (camHeight - 100) * canvas.height / 2));
+                    const carW = Math.round(scale * 400 * canvas.width / 2);
+                    const carH = carW * 0.6;
+
+                    if(!c.exploded) {
+                        ctx.fillStyle = c.color;
+                        ctx.fillRect(screenX - carW/2, screenY - carH, carW, carH);
+                        // Glass Window
+                        ctx.fillStyle = '#2c3e50';
+                        ctx.fillRect(screenX - carW/2.5, screenY - carH*0.8, carW * 0.8, carH * 0.3);
+                        // Traffic Headlights facing player
+                        ctx.fillStyle = '#fffde7';
+                        ctx.beginPath(); ctx.arc(screenX - carW/3, screenY - carH*0.2, carW*0.1, 0, Math.PI*2); ctx.fill();
+                        ctx.beginPath(); ctx.arc(screenX + carW/3, screenY - carH*0.2, carW*0.1, 0, Math.PI*2); ctx.fill();
+                    } else {
+                        // Explosion Animation Graphic Blast!
+                        ctx.fillStyle = '#f39c12';
+                        ctx.beginPath(); ctx.arc(screenX, screenY - carH/2, carW * (1 + (30 - c.explosionTimer)/10), 0, Math.PI*2); ctx.fill();
+                        ctx.fillStyle = '#e74c3c';
+                        ctx.beginPath(); ctx.arc(screenX, screenY - carH/2, carW * 0.7 * (1 + (30 - c.explosionTimer)/10), 0, Math.PI*2); ctx.fill();
+                    }
+                }
+            });
+
+            // Draw Player's Car (Centered base, unless in Hood View)
+            if (cameraView !== "hood") {
+                const pW = 180;
+                const pH = 100;
+                const pX = canvas.width / 2;
+                const pY = canvas.height - 40 - (cameraView === "far" ? 60 : 0);
+
+                // Car Shadow
+                ctx.fillStyle = 'rgba(0,0,0,0.4)';
+                ctx.fillRect(pX - pW/2 - 10, pY - 10, pW + 20, 20);
+
+                // Car Main Chassis
+                ctx.fillStyle = '#e74c3c'; // Real sports car red color base
+                ctx.fillRect(pX - pW/2, pY - pH, pW, pH);
+                
+                // Rear Windshield Window
+                ctx.fillStyle = '#34495e';
+                ctx.fillRect(pX - pW/3, pY - pH + 15, (pW/3)*2, pH * 0.35);
+
+                // Rear Wheels
+                ctx.fillStyle = '#111';
+                ctx.fillRect(pX - pW/2 - 5, pY - 35, 12, 35);
+                ctx.fillRect(pX + pW/2 - 7, pY - 35, 12, 35);
+
+                // Braking tail lights / Standard running lights mapping
+                const isBraking = keys.ArrowDown || keys.s;
+                ctx.fillStyle = isBraking ? '#ff0000' : '#990000'; // Lights intensify bright red on brake
+                ctx.fillRect(pX - pW/2 + 10, pY - pH + 65, 30, 15);
+                ctx.fillRect(pX + pW/2 - 40, pY - pH + 65, 30, 15);
+                
+                // Add yellow center indicator details inside lights
+                if(isBraking) {
+                    ctx.fillStyle = '#ffcdd2';
+                    ctx.fillRect(pX - pW/2 + 15, pY - pH + 70, 20, 5);
+                    ctx.fillRect(pX + pW/2 - 35, pY - pH + 70, 20, 5);
+                }
+
+                // Front High Beam Lights project subtle beams forward down the road 
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+                ctx.beginPath();
+                ctx.moveTo(pX - pW/3, pY - pH);
+                ctx.lineTo(0, 0); ctx.lineTo(canvas.width, 0);
+                ctx.lineTo(pX + pW/3, pY - pH);
+                ctx.closePath(); ctx.fill();
+            }
+        }
+
+        // Framework Engine Looping
+        let lastTime = 0;
+        function loop(timestamp) {
+            let dt = (timestamp - lastTime) / 1000;
+            if(dt > 0.1) dt = 0.1; // Cap time step
+            lastTime = timestamp;
+
+            update(dt);
+            draw();
+            requestAnimationFrame(loop);
+        }
+        requestAnimationFrame(loop);
+
+    </script>
+</body>
+</html>wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwsssssssaaaaaaaa
